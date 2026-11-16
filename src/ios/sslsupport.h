@@ -12,5 +12,7 @@
 - (void)download:(CDVInvokedUrlCommand*)command;
 - (void)cancelRequest:(CDVInvokedUrlCommand*)command;
 - (void)setUserAgent:(CDVInvokedUrlCommand*)command;
+- (void)clearCookies:(CDVInvokedUrlCommand*)command;
+- (void)clearAllCookies:(CDVInvokedUrlCommand*)command;
 
 @end

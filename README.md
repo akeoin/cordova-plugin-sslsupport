@@ -113,7 +113,7 @@ sslHTTP.validateDomainName(true, function() {
 
 ### getCookies
 
-Get currently stored cookies. Internally, the plugin will store any cookie, passing it along with any request, but to javascript only cookies which do not have `httpOnly` flag will be available for reading. The plugin tries to follow the standard browser security settings when it comes to cookies.
+Get currently stored, unexpired cookies, including session cookies and `httpOnly` cookies (check the `httpOnly` field). The plugin stores any cookie it receives and sends it along with matching requests. Android and iOS return the same shape.
 Cookies are not shared with the webview.
 
 ```
@@ -124,14 +124,48 @@ sslHTTP.getCookies(domain, function(cookies) {
 });
 ```
 
-If you wish to get cookies from all domains pass `null` or `all` as domain value.
+If you wish to get cookies from all domains pass `null` or `all` as domain value. Otherwise only cookies whose domain contains the given string are returned.
 The success callback recevies the following object:
 
 ```
 {
-    cookiename : { path: <string>, value : <string>, name:<string>, domain:<string> }
+    cookiename : {
+        name: <string>, value: <string>, domain: <string>, path: <string>,
+        expires: <number>,   // seconds since epoch, 0 for session cookies
+        secure: <boolean>, httpOnly: <boolean>, version: <number>
+    }
 }
 ```
+
+Results are keyed by cookie name, so if two cookies share a name (different domains or paths) only one of them is returned. Pass a domain to narrow it down.
+
+### clearCookies
+
+Remove cookies by name from the plugin's cookie store. The webview's cookies are not touched.
+
+```
+sslHTTP.clearCookies(["session", "token"], domain, function(removedCount) {
+    console.log(removedCount);
+}, function(err) {
+    console.log(err);
+});
+```
+
+`domain` works the same as in `getCookies` (`"all"`/`null` for every domain, otherwise a substring of the cookie domain). The success callback receives the number of cookies removed.
+
+### clearAllCookies
+
+Remove every cookie from the plugin's cookie store, for example on logout. The webview's cookies are not touched.
+
+```
+sslHTTP.clearAllCookies(null, function(removedCount) {
+    console.log(removedCount);
+}, function(err) {
+    console.log(err);
+});
+```
+
+Pass a domain instead of `null` to only remove cookies whose domain contains that string. The success callback receives the number of cookies removed.
 
 ### New in 1.1 - download
 

@@ -136,7 +136,59 @@ public class CordovaPluginSslSupport extends CordovaPlugin {
     // private PersistentCookieJar persistentCookieJar;
     CallbackContext PUBLIC_CALLBACKS = null;
 
+    // The jar given to OkHttp (wraps persistentCookieJar, see SessionAwareCookieJar)
     ClearableCookieJar cookieJar;
+    // The library jar. Its methods synchronize on it, so the cookie code below locks it too.
+    PersistentCookieJar persistentCookieJar;
+    // Kept so the cookie methods can read and remove single cookies (PersistentCookieJar only exposes clear-all)
+    SetCookieCache cookieCache;
+    SharedPrefsCookiePersistor cookiePersistor;
+
+    // Fixes a gap in PersistentCookieJar: when a response replaces a persistent cookie with a session cookie
+    // of the same identity, the library updates its in-memory cache but leaves the old persistent copy on
+    // disk. After an app restart that stale copy is loaded again and sent to the server.
+    // This wrapper deletes the on-disk copy whenever a session cookie is received.
+    private static final class SessionAwareCookieJar implements ClearableCookieJar {
+        private final PersistentCookieJar delegate;
+        private final CookiePersistor persistor;
+
+        SessionAwareCookieJar(PersistentCookieJar delegate, CookiePersistor persistor) {
+            this.delegate = delegate;
+            this.persistor = persistor;
+        }
+
+        @Override
+        public void saveFromResponse(@NonNull HttpUrl url, @NonNull List<Cookie> cookies) {
+            synchronized (delegate) {
+                delegate.saveFromResponse(url, cookies);
+                List<Cookie> sessionCookies = new ArrayList<>();
+                for (Cookie cookie : cookies) {
+                    if (!cookie.persistent()) {
+                        sessionCookies.add(cookie);
+                    }
+                }
+                if (!sessionCookies.isEmpty()) {
+                    persistor.removeAll(sessionCookies);
+                }
+            }
+        }
+
+        @NonNull
+        @Override
+        public List<Cookie> loadForRequest(@NonNull HttpUrl url) {
+            return delegate.loadForRequest(url);
+        }
+
+        @Override
+        public void clearSession() {
+            delegate.clearSession();
+        }
+
+        @Override
+        public void clear() {
+            delegate.clear();
+        }
+    }
 
     Activity activity;
     ApplicationInfo appliInfo = null;
@@ -242,6 +294,22 @@ public class CordovaPluginSslSupport extends CordovaPlugin {
                 return false;
             }
             return true;
+        } else if (action.equals("clearCookies")) {
+            try {
+                this.clearCookies(args, callbackContext);
+            } catch (Exception e) {
+                callbackContext.error(e.getMessage());
+                return false;
+            }
+            return true;
+        } else if (action.equals("clearAllCookies")) {
+            try {
+                this.clearAllCookies(args, callbackContext);
+            } catch (Exception e) {
+                callbackContext.error(e.getMessage());
+                return false;
+            }
+            return true;
         } else if(action.equals("setRequestTimeout")) {
             try{
                 this.setRequestTimeout(args, callbackContext);
@@ -305,7 +373,10 @@ public class CordovaPluginSslSupport extends CordovaPlugin {
         if (!OKHTTPCLIENT_INIT) {
             Log.i("SSLpinning", "OKHTTPCLIENT_INIT: Done");
 
-            cookieJar = new PersistentCookieJar(new SetCookieCache(), new SharedPrefsCookiePersistor(context));
+            cookieCache = new SetCookieCache();
+            cookiePersistor = new SharedPrefsCookiePersistor(context);
+            persistentCookieJar = new PersistentCookieJar(cookieCache, cookiePersistor);
+            cookieJar = new SessionAwareCookieJar(persistentCookieJar, cookiePersistor);
             httpclient = httpclient.newBuilder()
                     .cookieJar(cookieJar)
                     .build();
@@ -318,54 +389,134 @@ public class CordovaPluginSslSupport extends CordovaPlugin {
         }
     }
 
-    // ########### Get all cookies function
+    // ########### Cookies
+    // Kept in step with the iOS implementation (sslsupport.m): same arguments, filtering and result shape.
+    // The plugin's cookie store is the OkHttp jar; it is not shared with the WebView.
+
+    // getCookies(domainFilter)
+    // args[0] (optional): "all" (default) or a substring the cookie domain must contain.
+    // Returns { <name>: { name, value, domain, path, expires, secure, httpOnly, version } } for unexpired cookies,
+    // session cookies included. expires is seconds since epoch, 0 for session cookies.
     private void getCookies(JSONArray args, CallbackContext callbackContext) throws JSONException {
-        String domainName = "all";
-        if (args.length() > 0) {
-            domainName = args.getString(0);
+        String domainFilter = domainFilterFromArgs(args, 0);
+        long now = System.currentTimeMillis();
+        JSONObject result = new JSONObject();
+
+        // the cache is what requests are sent from: it holds session cookies (never persisted) and persistent ones
+        synchronized (persistentCookieJar) {
+            for (Cookie cookie : cookieCache) {
+                // skip expired cookies; they are never sent and are dropped on the next request
+                if (cookie.expiresAt() < now || !cookieMatchesDomain(cookie, domainFilter)) {
+                    continue;
+                }
+                result.put(cookie.name(), cookieToJson(cookie));
+            }
         }
 
-        boolean addthiscookie;
-        String cookiedomain;
+        callbackContext.success(result);
+    }
 
-        JSONObject jsonCookies = new JSONObject();
+    // clearCookies(names, domainFilter)
+    // args[0]: array of cookie names to remove, args[1] (optional): domain filter, as in getCookies.
+    // Removes matching cookies from the plugin's cookie store. Returns the number of cookies removed.
+    private void clearCookies(JSONArray args, CallbackContext callbackContext) throws JSONException {
+        JSONArray namesArg = args.optJSONArray(0);
+        if (namesArg == null || namesArg.length() == 0) {
+            callbackContext.error("clearCookies: cookie names are required");
+            return;
+        }
+        final Set<String> names = new HashSet<>();
+        for (int i = 0; i < namesArg.length(); i++) {
+            names.add(namesArg.getString(i));
+        }
+        final String domainFilter = domainFilterFromArgs(args, 1);
 
-        // for all persistent cookies
-        try {
+        int removed = removeCookies(new CookieFilter() {
+            @Override
+            public boolean matches(Cookie cookie) {
+                return names.contains(cookie.name()) && cookieMatchesDomain(cookie, domainFilter);
+            }
+        });
+        callbackContext.success(removed);
+    }
 
-            List<Cookie> cookies = loadAllPersistentCookies();
-            for (int i = 0; i < cookies.size(); i++) {
-                Cookie cookie = cookies.get(i);
-                cookiedomain = cookie.domain();
-                if (domainName.equals("all")) {
-                    addthiscookie = true;
-                } else {
-                    if (cookiedomain.contains(domainName)) {
-                        addthiscookie = true;
-                    } else {
-                        addthiscookie = false;
-                    }
-                }
+    // clearAllCookies(domainFilter)
+    // args[0] (optional): domain filter, as in getCookies. "all" (default) empties the plugin's cookie store.
+    // Returns the number of cookies removed.
+    private void clearAllCookies(JSONArray args, CallbackContext callbackContext) {
+        final String domainFilter = domainFilterFromArgs(args, 0);
 
-                if (addthiscookie) {
-                    JSONObject jsonCookie = new JSONObject();
-                    jsonCookie.put("name", cookie.name());
-                    jsonCookie.put("value", cookie.value());
-                    jsonCookie.put("domain", cookie.domain());
-                    jsonCookie.put("path", cookie.path());
-                    // dividing with 100 to convert it into timeInSeconds
-                    jsonCookie.put("expires", cookie.expiresAt() > 0 ? cookie.expiresAt() / 1000 : 0);
+        int removed = removeCookies(new CookieFilter() {
+            @Override
+            public boolean matches(Cookie cookie) {
+                return cookieMatchesDomain(cookie, domainFilter);
+            }
+        });
+        callbackContext.success(removed);
+    }
 
-                    jsonCookies.put(cookie.name(), jsonCookie);
+    private interface CookieFilter {
+        boolean matches(Cookie cookie);
+    }
+
+    // Removes matching cookies from the in-memory cache and the persisted store; returns how many were removed
+    private int removeCookies(CookieFilter filter) {
+        // PersistentCookieJar's methods synchronize on the jar, so lock it while editing its cache and store
+        synchronized (persistentCookieJar) {
+            // keyed by cookie identity (name, domain, path, secure, hostOnly) so a cookie found in both
+            // the cache and the persisted store is counted once
+            Map<String, Cookie> removed = new LinkedHashMap<>();
+
+            // the cache is what requests are sent from; session cookies only ever live here
+            for (Iterator<Cookie> it = cookieCache.iterator(); it.hasNext();) {
+                Cookie cookie = it.next();
+                if (filter.matches(cookie)) {
+                    it.remove();
+                    removed.put(cookieIdentity(cookie), cookie);
                 }
             }
+            // also sweep the persisted store, which can hold stale copies the cache no longer has
+            // (e.g. ones left on disk before SessionAwareCookieJar was added)
+            for (Cookie cookie : cookiePersistor.loadAll()) {
+                if (filter.matches(cookie)) {
+                    removed.put(cookieIdentity(cookie), cookie);
+                }
+            }
+            cookiePersistor.removeAll(removed.values());
 
-            callbackContext.success(jsonCookies);
-        } catch (JSONException je) {
-            Log.e("CookieError", je.getMessage());
-            callbackContext.error(je.getMessage());
+            return removed.size();
         }
+    }
 
+    // "all" when the argument is missing, null or empty; otherwise the filter string
+    private static String domainFilterFromArgs(JSONArray args, int index) {
+        if (args.length() <= index || args.isNull(index)) {
+            return "all";
+        }
+        String filter = args.optString(index, "all");
+        return filter.isEmpty() ? "all" : filter;
+    }
+
+    private static boolean cookieMatchesDomain(Cookie cookie, String domainFilter) {
+        return domainFilter.equals("all") || cookie.domain().contains(domainFilter);
+    }
+
+    private static JSONObject cookieToJson(Cookie cookie) throws JSONException {
+        JSONObject json = new JSONObject();
+        json.put("name", cookie.name());
+        json.put("value", cookie.value());
+        json.put("domain", cookie.domain());
+        json.put("path", cookie.path());
+        json.put("expires", cookie.persistent() ? cookie.expiresAt() / 1000 : 0);
+        json.put("secure", cookie.secure());
+        json.put("httpOnly", cookie.httpOnly());
+        json.put("version", 0); // OkHttp only models RFC 6265 cookies; iOS reports the same 0 for them
+        return json;
+    }
+
+    private static String cookieIdentity(Cookie cookie) {
+        return cookie.name() + "|" + cookie.domain() + "|" + cookie.path() + "|" + cookie.secure() + "|"
+                + cookie.hostOnly();
     }
 
     //########### Set request max timeout
@@ -391,25 +542,6 @@ public class CordovaPluginSslSupport extends CordovaPlugin {
             Log.e("SSLSetRequestTimeoutError", e.getMessage());
             callbackContext.error(e.getMessage());
         }
-    }
-
-    // ###################################################### Helper function
-    private List<Cookie> loadAllPersistentCookies() {
-        activity = this.cordova.getActivity();
-        Context context = activity.getApplicationContext();
-
-        SharedPreferences sharedPreferences = context.getSharedPreferences("CookiePersistence", Context.MODE_PRIVATE);
-        // List<Cookie> cookies = new ArrayList<>(sharedPreferences.getAll().size());
-        List cookies = new ArrayList(sharedPreferences.getAll().size());
-
-        for (Map.Entry<String, ?> entry : sharedPreferences.getAll().entrySet()) {
-            String serializedCookie = (String) entry.getValue();
-            Cookie cookie = new SerializableCookie().decode(serializedCookie);
-            if (cookie != null) {
-                cookies.add(cookie);
-            }
-        }
-        return cookies;
     }
 
     // ########### Enable or disable SSL function

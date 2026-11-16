@@ -149,6 +149,31 @@ var http = {
 		var domain = typeof params == "string" ? params || "all" : "all";
 		return exec(success, failure, "CordovaPluginSslSupport", "getCookies", [domain]);
 	},
+	/**
+	 * Remove cookies by name from the plugin's native cookie store (Android: OkHttp cookie jar,
+	 * iOS: NSHTTPCookieStorage), which JS cookie APIs can't reach. The webview's cookies are not touched.
+	 * @param {string[]} names cookie names to remove
+	 * @param {string} [domain] "all" (default) or a substring the cookie domain must contain, like getCookies
+	 * success receives the number of cookies removed
+	 */
+	clearCookies: function (names, domain, success, failure) {
+		if (!Array.isArray(names) || names.length === 0) {
+			if (failure) failure("clearCookies: cookie names are required");
+			return;
+		}
+		var domainFilter = typeof domain == "string" ? domain || "all" : "all";
+		return exec(success, failure, "CordovaPluginSslSupport", "clearCookies", [names, domainFilter]);
+	},
+	/**
+	 * Remove every cookie from the plugin's native cookie store, e.g. on logout.
+	 * The webview's cookies are not touched.
+	 * @param {string} [domain] "all" (default) or a substring the cookie domain must contain, like getCookies
+	 * success receives the number of cookies removed
+	 */
+	clearAllCookies: function (domain, success, failure) {
+		var domainFilter = typeof domain == "string" ? domain || "all" : "all";
+		return exec(success, failure, "CordovaPluginSslSupport", "clearAllCookies", [domainFilter]);
+	},
     setRequestTimeout: function (params, success, failure) {
         var connect = 10;
         var write = 10;
