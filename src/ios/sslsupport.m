@@ -410,67 +410,105 @@
 }
 
 
+#pragma mark - Cookies
+// Kept in step with the Android implementation (CordovaPluginSslSupport.java): same arguments, filtering and
+// result shape. The plugin's cookie store is NSHTTPCookieStorage; it is not shared with the WKWebView.
+
+// "all" when the argument is missing, null or empty; otherwise the filter string
+static NSString *SSLDomainFilterFromArguments(NSArray *arguments, NSUInteger index) {
+    id arg = [arguments count] > index ? [arguments objectAtIndex:index] : nil;
+    if ([arg isKindOfClass:[NSString class]] && [arg length] > 0) {
+        return arg;
+    }
+    return @"all";
+}
+
+static BOOL SSLCookieMatchesDomain(NSHTTPCookie *cookie, NSString *domainFilter) {
+    return [domainFilter isEqualToString:@"all"] || [cookie.domain rangeOfString:domainFilter].location != NSNotFound;
+}
+
+static NSDictionary *SSLCookieToDictionary(NSHTTPCookie *cookie) {
+    long long expires = cookie.expiresDate ? (long long)cookie.expiresDate.timeIntervalSince1970 : 0;
+    return @{
+        @"name": cookie.name,
+        @"value": cookie.value,
+        @"domain": cookie.domain,
+        @"path": cookie.path,
+        @"expires": @(expires),
+        @"secure": @(cookie.isSecure),
+        @"httpOnly": @(cookie.isHTTPOnly),
+        @"version": @(cookie.version)
+    };
+}
+
+// Removes matching cookies from the plugin's cookie store; returns how many were removed
+static NSInteger SSLRemoveCookies(BOOL (^matches)(NSHTTPCookie *cookie)) {
+    NSHTTPCookieStorage *cookieStore = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    NSInteger removed = 0;
+    // -cookies returns a snapshot, so deleting while iterating is safe
+    for (NSHTTPCookie *cookie in [cookieStore cookies]) {
+        if (matches(cookie)) {
+            [cookieStore deleteCookie:cookie];
+            removed++;
+        }
+    }
+    return removed;
+}
+
+// getCookies(domainFilter)
+// arguments[0] (optional): "all" (default) or a substring the cookie domain must contain.
+// Returns { <name>: { name, value, domain, path, expires, secure, httpOnly, version } } for unexpired cookies,
+// session cookies included. expires is seconds since epoch, 0 for session cookies.
 - (void)getCookies:(CDVInvokedUrlCommand*)command {
-    //    NSHTTPCookieStorage *cookies = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-    NSString *domainName = @"all";
-    if ([command.arguments count] > 0) {
-        if ([[command.arguments objectAtIndex:0] isEqual:[NSNull null]]){
-            NSLog(@"myString IS NULL!");
+    NSString *domainFilter = SSLDomainFilterFromArguments(command.arguments, 0);
+    NSDate *now = [NSDate date];
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+
+    for (NSHTTPCookie *cookie in [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies]) {
+        // skip expired cookies; session cookies have no expiry date
+        BOOL expired = cookie.expiresDate && [cookie.expiresDate compare:now] == NSOrderedAscending;
+        if (expired || !SSLCookieMatchesDomain(cookie, domainFilter)) {
+            continue;
         }
-        else{
-            if ([[command.arguments objectAtIndex:0] isEqualToString:@""]) {
-                NSLog(@"myString IS empty!");
-            } else {
-                NSLog(@"myString IS NOT empty, it is: %@", [command.arguments objectAtIndex:0]);
-                domainName = [command.arguments objectAtIndex:0];
-            }
-            //domainName = [command.arguments objectAtIndex:0];
-        }
+        [result setObject:SSLCookieToDictionary(cookie) forKey:cookie.name];
     }
-    //NSNumber *addthiscookie = [NSNumber numberWithInt:1];
-    Boolean addthiscookie = true;
-    
-    NSMutableDictionary * responseCookies = [NSMutableDictionary dictionary];
-    NSHTTPCookie *cookie;
-    NSHTTPCookieStorage *cookieJar = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-    for (cookie in [cookieJar cookies]) {
-        
-        if([domainName isEqualToString:@"all"])
-        {
-            //addthiscookie = [NSNumber numberWithInt:1];
-            addthiscookie = true;
-        } else {
-            if([[cookie domain] rangeOfString:domainName].location != NSNotFound) {
-                NSLog(@"cookie has the desired domain:%@", cookie);
-               addthiscookie = true;
-            } else {
-                addthiscookie = false;
-            }
-        }
-        if(cookie.isHTTPOnly)  { addthiscookie = false; }
 
-        NSDate* currentDate = [NSDate date];
+    CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:result];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+}
 
-        if(!cookie.sessionOnly && cookie.expiresDate && [cookie.expiresDate compare:currentDate] == NSOrderedAscending) {
-            addthiscookie = false;
-        }
-
-        //NSLog(@"%@", cookie);
-        if(addthiscookie) {
-            NSMutableDictionary *cookieProperties = [NSMutableDictionary dictionary];
-            [cookieProperties setObject:cookie.name forKey:[NSHTTPCookieName lowercaseString]];
-            [cookieProperties setObject:cookie.value forKey:[NSHTTPCookieValue lowercaseString]];
-            [cookieProperties setObject:cookie.domain forKey:[NSHTTPCookieDomain lowercaseString]];
-            [cookieProperties setObject:cookie.path forKey:[NSHTTPCookiePath lowercaseString]];
-            [cookieProperties setObject:[NSNumber numberWithLong:cookie.version] forKey:[NSHTTPCookieVersion lowercaseString]];
-            [cookieProperties setObject:[NSNumber numberWithLong:cookie.expiresDate.timeIntervalSince1970] forKey:[NSHTTPCookieExpires lowercaseString]];
-            [responseCookies setObject:cookieProperties forKey:cookie.name];
-        }
+// clearCookies(names, domainFilter)
+// arguments[0]: array of cookie names to remove, arguments[1] (optional): domain filter, as in getCookies.
+// Removes matching cookies from the plugin's cookie store. Returns the number of cookies removed.
+- (void)clearCookies:(CDVInvokedUrlCommand*)command {
+    NSArray *namesArg = [command.arguments count] > 0 ? [command.arguments objectAtIndex:0] : nil;
+    if (![namesArg isKindOfClass:[NSArray class]] || [namesArg count] == 0) {
+        CDVPluginResult* errorResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"clearCookies: cookie names are required"];
+        [self.commandDelegate sendPluginResult:errorResult callbackId:command.callbackId];
+        return;
     }
-    // cookie code ends
-    NSLog(@"%@", responseCookies);
-    
-    CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:responseCookies];
+    NSSet *names = [NSSet setWithArray:namesArg];
+    NSString *domainFilter = SSLDomainFilterFromArguments(command.arguments, 1);
+
+    NSInteger removed = SSLRemoveCookies(^BOOL(NSHTTPCookie *cookie) {
+        return [names containsObject:cookie.name] && SSLCookieMatchesDomain(cookie, domainFilter);
+    });
+
+    CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsNSInteger:removed];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+}
+
+// clearAllCookies(domainFilter)
+// arguments[0] (optional): domain filter, as in getCookies. "all" (default) empties the plugin's cookie store.
+// Returns the number of cookies removed.
+- (void)clearAllCookies:(CDVInvokedUrlCommand*)command {
+    NSString *domainFilter = SSLDomainFilterFromArguments(command.arguments, 0);
+
+    NSInteger removed = SSLRemoveCookies(^BOOL(NSHTTPCookie *cookie) {
+        return SSLCookieMatchesDomain(cookie, domainFilter);
+    });
+
+    CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsNSInteger:removed];
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
